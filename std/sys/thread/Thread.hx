@@ -20,297 +20,624 @@
  * DEALINGS IN THE SOFTWARE.
  */
 
-package sys.thread;
+package jvm;
 
-#if (!target.threaded)
-#error "This class is not available on this target"
-#end
+import Enum;
+import haxe.Constraints;
+import haxe.ds.Option;
+import haxe.ds.Vector;
+import haxe.extern.Rest;
+import java.lang.NullPointerException;
+import jvm.DynamicObject;
+import jvm.EmptyConstructor;
+import jvm.NativeArray;
+import jvm.Object;
+import jvm.annotation.ClassReflectionInformation;
+import jvm.annotation.EnumReflectionInformation;
+import jvm.annotation.EnumValueReflectionInformation;
 
-import sys.thread.ThreadCallback;
-
-typedef CurrentThreadCallbacks = {
-	/**
-		Called when the thread has successfully completed its job. Not called if the thread throws.
-	**/
-	?onJobDone:() -> Void,
-	/**
-		Called when an uncaught exception aborts the thread. If this callback throws, the exception
-		is forwarded to the default abort handler and `onExit` callbacks are still called.
-	**/
-	?onAbort:haxe.Exception -> Void,
-	/**
-		Called when the thread is exiting, after `onAbort` if applicable. If this callback throws,
-		the exception is forwarded to the default abort handler, ignoring any assigned `onAbort`.
-	**/
-	?onExit:() -> Void
-}
-
-typedef ThreadCallbacks = CurrentThreadCallbacks & {
-	/**
-		Called from the creating thread, synchronously within `Thread.create`, just before the
-		new thread is actually spawned. Unlike `onStart`, this fires in the context of the
-		creating thread, so `Thread.current()` returns the creating thread, not the new thread.
-	**/
-	?onCreate:() -> Void,
-	/**
-		Called when the thread starts, before the job is executed.
-	**/
-	?onStart:() -> Void
-}
-
-class Thread {
-
-	static var threads : Array<Thread>;
-	static var mutex : Mutex;
-	static var mainThread : Thread;
-	static var idCounter : Int; // TODO: Should probably be an AtomicInt
-	static var globalCallbacks : ThreadCallbackManager;
-
-	@:deprecated("Use haxe.EventLoop.getThreadLoop(thread) instead")
-	public var events(get, null):Null<haxe.EventLoop>;
-
-	inline function get_events() {
-		return haxe.EventLoop.getThreadLoop(this);
+@:keep
+@:native('haxe.jvm.Jvm')
+class Jvm {
+	// https://github.com/HaxeFoundation/haxe/issues/12985
+	static var mainThread:sys.thread.Thread;
+	
+	public static function init():Void {
+		#if std_encoding_utf8
+		try {
+			java.lang.System.setOut(new java.io.PrintStream(java.lang.System.out, true, "utf-8"));
+			java.lang.System.setErr(new java.io.PrintStream(java.lang.System.err, true, "utf-8"));
+		} catch (e:java.io.UnsupportedEncodingException) {}
+		#end
+		
+		mainThread = sys.thread.Thread.main();
 	}
 
-	public final id : Int;
-	var impl : ThreadImpl;
-	var messages : Deque<Dynamic>;
-	final callbacks : ThreadCallbackManager;
-
-	/**
-		Allows to query or change the name of the thread. On some platforms this might allow debugger to identify threads.
-	**/
-	public var name(default,set) : Null<String>;
-
-	/**
-		Tells if a thread is a native thread that is not managed by Haxe.
-		See `Thread.current` for details.
-	**/
-	public var isNative(default,null) : Bool;
-
-	function new(impl) {
-		this.id = idCounter++;
-		this.impl = impl;
-		if( impl != null ) this.name = ThreadImpl.getName(impl);
-		callbacks = new ThreadCallbackManager();
+	static public function getNativeType<T>(obj:T):java.lang.Class<T> {
+		var obj:java.lang.Object = (cast obj : java.lang.Object);
+		return cast obj.getClass();
 	}
 
-	function set_name(n) {
-		name = n;
-		if( impl != null ) ThreadImpl.setName(impl,name == null ? "" : name);
-		return n;
-	}
+	extern static public function instanceof<S, T>(obj:S, type:T):Bool;
 
-	public function toString() {
-		return "Thread#"+(name ?? Std.string(impl));
-	}
+	extern static public function referenceEquals<T>(v1:T, v2:T):Bool;
 
-	public function sendMessage( msg : Dynamic ) {
-		if( messages == null ) {
-			mutex.acquire();
-			if( messages == null ) messages = new Deque();
-			mutex.release();
+	static public function stringCompare(v1:String, v2:String):Int {
+		if (v1 == null) {
+			return v2 == null ? 0 : 1;
 		}
-		messages.add(msg);
+		if (v2 == null) {
+			return -1;
+		}
+		return (cast v1 : java.NativeString).compareTo(v2);
 	}
 
-	public function disposeNative() {
-		if( !isNative ) return;
-		dispose();
+	static public function compare<T>(v1:T, v2:T):Int {
+		return Reflect.compare(v1, v2);
 	}
 
-
-	function dispose() {
-		mutex.acquire();
-		threads.remove(this);
-		mutex.release();
-		currentTLS.value = null;
+	static public function compareFunctions(v1:Dynamic, v2:Dynamic):Bool {
+		return Reflect.compareMethods(v1, v2);
 	}
 
-	public static function readMessage( blocking : Bool ) : Null<Dynamic> {
-		var t = current();
-		if( t.messages == null ) {
-			mutex.acquire();
-			if( t.messages == null ) t.messages = new Deque();
-			mutex.release();
+	static public function enumEq(v1:Dynamic, v2:Dynamic) {
+		if (!instanceof(v1, jvm.Enum)) {
+			return false;
 		}
-		return t.messages.pop(blocking);
+		if (!instanceof(v2, jvm.Enum)) {
+			return false;
+		}
+		return Type.enumEq(v1, v2);
 	}
 
-	static var currentTLS : Tls<Thread>;
-
-	/**
-		Returns the current thread.
-		If you are calling this function from a native thread that is not the main thread and was not created by `Thread.create`, this will return you
-		a native thread with a `null` EvenLoop and `isNative` set to true. You need to call `disposeNative()` on such value on thread termination.
-	**/
-	public static function current():Thread {
-		var t = currentTLS.value;
-		if( t != null )
-			return t;
-		var impl = ThreadImpl.current();
-		var t = new Thread(impl);
-		t.isNative = true;
-		mutex.acquire();
-		threads.push(t);
-		mutex.release();
-		currentTLS.value = t;
-		return t;
+	static public function maybeEnumEq(v1:Dynamic, v2:Dynamic) {
+		if (!instanceof(v1, jvm.Enum)) {
+			return compare(v1, v2) == 0;
+		}
+		if (!instanceof(v2, jvm.Enum)) {
+			return compare(v1, v2) == 0;
+		}
+		return Type.enumEq(v1, v2);
 	}
 
-	/**
-		Returns the main thread
-	**/
-	public static inline function main() {
-		return mainThread;
+	// calls
+
+	static public function getArgumentTypes(args:NativeArray<Dynamic>):NativeArray<java.lang.Class<Dynamic>> {
+		var argTypes:NativeArray<java.lang.Class<Dynamic>> = new NativeArray(args.length);
+		for (i in 0...args.length) {
+			var arg = (cast args[i] : java.lang.Object);
+			argTypes[i] = arg == null ? (cast java.lang.Object) : arg.getClass();
+		}
+		return argTypes;
 	}
 
-	static function installCallbacks(host:ThreadCallbackManager, callbacks:ThreadCallbacks) {
-		final handles:Array<IThreadCallbackHandle> = [];
-		if (callbacks.onCreate != null) {
-			handles.push(host.onCreate(callbacks.onCreate));
-		}
-		if (callbacks.onStart != null) {
-			handles.push(host.onStart(callbacks.onStart));
-		}
-		if (callbacks.onJobDone != null) {
-			handles.push(host.onJobDone(callbacks.onJobDone));
-		}
-		if (callbacks.onAbort != null) {
-			handles.push(host.onAbort(callbacks.onAbort));
-		}
-		if (callbacks.onExit != null) {
-			handles.push(host.onExit(callbacks.onExit));
-		}
-		if (handles.length == 1) {
-			return handles[0];
-		}
-		return new MultiHandle(handles);
-	}
-
-	/**
-		Creates a new thread that will execute the `job` function, then exit after all events are processed.
-		You can specify a custom exception handler `onAbort` or else `Thread.onAbort` will be called.
-	**/
-	public static function create(?name:String, job:()->Void, ?callbacks:ThreadCallbacks):Thread {
-		mutex.acquire();
-		var t = new Thread(null);
-		threads.push(t);
-		mutex.release();
-
-		if (callbacks != null) {
-			if (callbacks.onAbort == null) {
-				callbacks.onAbort = t.onAbort;
+	static public function unifyCallArguments(args:NativeArray<Dynamic>, params:NativeArray<java.lang.Class<Dynamic>>,
+			allowPadding:Bool = false):Option<NativeArray<Dynamic>> {
+		var callArgs:NativeArray<Dynamic> = {
+			if (args.length < params.length) {
+				var callArgs = new NativeArray(params.length);
+				Vector.blit(cast args, 0, cast callArgs, 0, args.length);
+				callArgs;
+			} else {
+				Vector.fromData(args).copy().toData();
 			}
-			installCallbacks(t.callbacks, callbacks);
+		}
+		if (params.length < args.length) {
+			return None;
+		}
+		for (i in 0...params.length) {
+			var paramType = params[i];
+			if (i >= args.length) {
+				if (paramType == cast Bool) {
+					callArgs[i] = false;
+				} else if (paramType == cast Float) {
+					callArgs[i] = 0.0;
+				} else if (paramType == cast Int) {
+					callArgs[i] = 0;
+				} else {
+					if (!allowPadding) {
+						return None;
+					}
+					callArgs[i] = null;
+				}
+				continue;
+			}
+			var argValue = args[i];
+			if (argValue == null) {
+				if (paramType.isPrimitive()) {
+					if (paramType == cast Bool) {
+						callArgs[i] = false;
+					} else if (paramType == cast Float) {
+						callArgs[i] = 0.0;
+					} else if (paramType == cast Int) {
+						callArgs[i] = 0;
+					} else {
+						throw 'Unexpected basic type: $paramType';
+					}
+				} else {
+					callArgs[i] = null;
+				}
+				continue;
+			};
+			var argType = getNativeType(argValue);
+			var arg = getWrapperClass(paramType);
+			if (arg.isAssignableFrom(argType)) {
+				callArgs[i] = args[i];
+				continue;
+			}
+			if (arg == (cast java.lang.Double.DoubleClass) && argType == cast java.lang.Integer.IntegerClass) {
+				callArgs[i] = numberToDouble(args[i]);
+			} else {
+				return None;
+			}
+		}
+		return Some(callArgs);
+	}
+
+	static public function call(func:jvm.Function, args:NativeArray<Dynamic>) {
+		return func.invokeDynamic(args);
+	}
+
+	// casts
+
+	static public function dynamicToByte<T>(d:T):Null<java.lang.Byte> {
+		if (instanceof(d, java.lang.Number)) {
+			return numberToByte(cast d);
+		}
+		return null;
+	}
+
+	static public function dynamicToShort<T>(d:T):Null<java.lang.Short> {
+		if (instanceof(d, java.lang.Number)) {
+			return numberToShort(cast d);
+		}
+		return null;
+	}
+
+	static public function dynamicToInteger<T>(d:T):Null<Int> {
+		if (instanceof(d, java.lang.Number)) {
+			return numberToInteger(cast d);
+		}
+		return null;
+	}
+
+	static public function dynamicToLong<T>(d:T):Null<java.lang.Long> {
+		if (instanceof(d, java.lang.Number)) {
+			return numberToLong(cast d);
+		}
+		return null;
+	}
+
+	static public function dynamicToFloat<T>(d:T):Null<java.lang.Float> {
+		if (instanceof(d, java.lang.Number)) {
+			return numberToFloat(cast d);
+		}
+		return null;
+	}
+
+	static public function dynamicToDouble<T>(d:T):Null<Float> {
+		if (instanceof(d, java.lang.Number)) {
+			return numberToDouble(cast d);
+		}
+		return null;
+	}
+
+	static public function numberToByte(n:java.lang.Number):Null<java.lang.Byte> {
+		return n == null ? null : n.byteValue();
+	}
+
+	static public function numberToShort(n:java.lang.Number):Null<java.lang.Short> {
+		return n == null ? null : n.shortValue();
+	}
+
+	static public function numberToInteger(n:java.lang.Number):Null<Int> {
+		return n == null ? null : n.intValue();
+	}
+
+	static public function numberToLong(n:java.lang.Number):Null<java.lang.Long> {
+		return n == null ? null : n.longValue();
+	}
+
+	static public function numberToFloat(n:java.lang.Number):Null<java.lang.Float> {
+		return n == null ? null : n.floatValue();
+	}
+
+	static public function numberToDouble(n:java.lang.Number):Null<Float> {
+		return n == null ? null : n.doubleValue();
+	}
+
+	static public function toByte(d:Dynamic):jvm.Int8 {
+		return d == null ? 0 : (d : java.lang.Number).byteValue();
+	}
+
+	static public function toChar(d:Dynamic) {
+		return d == null ? 0 : (d : java.lang.Character).charValue();
+	}
+
+	static public function toDouble(d:Dynamic) {
+		return d == null ? 0. : (d : java.lang.Number).doubleValue();
+	}
+
+	static public function toFloat(d:Dynamic):Single {
+		return d == null ? 0. : (d : java.lang.Number).floatValue();
+	}
+
+	static public function toInt(d:Dynamic) {
+		return d == null ? 0 : (d : java.lang.Number).intValue();
+	}
+
+	static public function toLong(d:Dynamic) {
+		return d == null ? 0 : (d : java.lang.Number).longValue();
+	}
+
+	static public function toShort(d:Dynamic) {
+		return d == null ? 0 : (d : java.lang.Number).shortValue();
+	}
+
+	static public function toBoolean(d:Dynamic) {
+		return d == null ? false : (d : java.lang.Boolean).booleanValue();
+	}
+
+	static public function getWrapperClass<S, T>(c:java.lang.Class<S>):java.lang.Class<S> {
+		if (!c.isPrimitive()) {
+			return c;
+		}
+		// TODO: other basic types
+		return if (c == cast Int) {
+			cast java.lang.Integer.IntegerClass;
+		} else if (c == cast Float) {
+			cast java.lang.Double.DoubleClass;
+		} else if (c == cast Bool) {
+			cast java.lang.Boolean.BooleanClass;
 		} else {
-			t.callbacks.onAbort(t.onAbort);
+			c;
 		}
-		ThreadCallbackManager.invokeCallbacks(t.callbacks.onCreateCallback, globalCallbacks?.onCreateCallback);
-		t.impl = ThreadImpl.create(function() {
-			t.impl = ThreadImpl.current();
-			if( name != null ) t.name = name;
-			currentTLS.value = t;
-			var exception = null;
-			try {
-				#if hl
-				hl.Api.setErrorHandler(null);
-				#end
-				ThreadCallbackManager.invokeCallbacks(t.callbacks.onStartCallback, globalCallbacks?.onStartCallback);
-				job();
-				ThreadCallbackManager.invokeCallbacks(t.callbacks.onJobDoneCallback, globalCallbacks?.onJobDoneCallback);
-			}
-			#if eval
-			catch (_:eval.vm.NativeThread.NativeThreadExit) {
-				// This comes from a NativeThread.exit() call and is not a real exception
-			}
-			#end
-			catch( e ) {
-				exception = e;
-			}
+	}
 
-			if( exception != null ) {
-				try {
-					ThreadCallbackManager.invokeCallbacksArg(t.callbacks.onAbortCallback, globalCallbacks?.onAbortCallback, exception);
-				} catch ( e ) {
-					t.onAbort(e);
+	// access
+
+	static public function arrayRead(obj:Dynamic, index:Int) {
+		if (instanceof(obj, Array)) {
+			return (obj : Array<Dynamic>)[index];
+		}
+		throw 'Cannot array-read on $obj';
+	}
+
+	static public function arrayWrite(obj:Dynamic, index:Int, value:Dynamic):Void {
+		if (instanceof(obj, Array)) {
+			(obj : Array<Dynamic>)[index] = value;
+			return;
+		}
+		throw 'Cannot array-write on $obj';
+	}
+
+	static public function readFieldClosure(obj:Dynamic, name:String, parameterTypes:NativeArray<java.lang.Class<Dynamic>>):Dynamic {
+		var cl = getNativeType(obj);
+		var method = cl.getMethod(name, ...parameterTypes);
+		if (method.isBridge()) {
+			/* This is probably not what we want... go through all methods and see if we find one that
+				isn't a bridge. This is pretty awkward, but I can't figure out how to use the Java reflection
+				API properly. */
+			for (meth in cl.getMethods()) {
+				if (meth.getName() == name && !meth.isBridge() && method.getParameterTypes().length == parameterTypes.length) {
+					method = meth;
+					break;
 				}
 			}
+		}
+		return new jvm.Closure(obj, method);
+	}
 
-			try {
-				ThreadCallbackManager.invokeCallbacks(t.callbacks.onExitCallback, globalCallbacks?.onExitCallback);
-			} catch ( e ) {
-				t.onAbort(e);
+	static function readStaticField<T>(cl:java.lang.Class<T>, name:String):Dynamic {
+		var methods = cl.getMethods();
+		for (m in methods) {
+			if (m.getName() == name && !m.isSynthetic()) {
+				return new jvm.Closure(null, m);
 			}
-
-			t.dispose();
-		});
-		if( name != null ) t.name = name;
-		return t;
+		}
+		try {
+			var field = cl.getField(name);
+			field.setAccessible(true);
+			return field.get(null);
+		} catch (_:java.lang.NoSuchFieldException) {
+			return null;
+		}
 	}
 
-	/**
-		Returns a list of all currently running threads.
-		This excludes native threads which were created without Thread.create and have not been
-		registered with a call to Thread.current().
-	**/
-	public static function getAll() {
-		mutex.acquire();
-		var tl = threads.copy();
-		mutex.release();
-		return tl;
+	static public function readFieldNoObject(obj:Dynamic, name:String):Dynamic {
+		var cl = getNativeType(obj);
+		try {
+			var field = cl.getField(name);
+			field.setAccessible(true);
+			return field.get(obj);
+		} catch (_:java.lang.NoSuchFieldException) {
+			while (cl != null) {
+				var methods = cl.getMethods();
+				for (m in methods) {
+					if (m.getName() == name && !m.isSynthetic()) {
+						return new jvm.Closure(obj, m);
+					}
+				}
+				cl = cl.getSuperclass();
+			}
+			return null;
+		}
 	}
 
-	/**
-		Registers `callbacks` to be called for every thread, both already-running and future ones.
-		Returns a handle that can be used to unregister the callbacks.
-
-		Unlike callbacks passed to `Thread.create`, closing the returned handle prevents the
-		callbacks from being called even for threads that are already running.
-	**/
-	static public function addCallbacks(callbacks:ThreadCallbacks):IThreadCallbackHandle {
-		globalCallbacks ??= new ThreadCallbackManager();
-		return installCallbacks(globalCallbacks, callbacks);
+	static public function readField(obj:Dynamic, name:String):Dynamic {
+		if (obj == null) {
+			throw new NullPointerException(name);
+		}
+		if (name == null) {
+			return null;
+		}
+		if (instanceof(obj, jvm.Object)) {
+			return (cast obj : jvm.Object)._hx_getField(name);
+		}
+		if (instanceof(obj, java.lang.Class)) {
+			return readStaticField(cast obj, name);
+		}
+		if (instanceof(obj, java.NativeString)) {
+			switch (name) {
+				case "length":
+					return (obj : String).length;
+				case "charAt":
+					return StringExt.charAt.bind(obj);
+				case "charCodeAt":
+					return StringExt.charCodeAt.bind(obj);
+				case "indexOf":
+					return StringExt.indexOf.bind(obj);
+				case "iterator":
+					return function() return new haxe.iterators.StringIterator(obj);
+				case "keyValueIterator":
+					return function() return new haxe.iterators.StringKeyValueIterator(obj);
+				case "lastIndexOf":
+					return StringExt.lastIndexOf.bind(obj);
+				case "split":
+					return StringExt.split.bind(obj);
+				case "substr":
+					return StringExt.substr.bind(obj);
+				case "substring":
+					return StringExt.substring.bind(obj);
+				case "toLowerCase":
+					return StringExt.toLowerCase.bind(obj);
+				case "toUpperCase":
+					return StringExt.toUpperCase.bind(obj);
+			}
+		}
+		return readFieldNoObject(obj, name);
 	}
 
-	/**
-		Registers `callbacks` to be called for the current thread.
-	**/
-	static public function addCurrentCallbacks(callbacks:CurrentThreadCallbacks):IThreadCallbackHandle {
-		final thread = Thread.current();
-		return installCallbacks(thread.callbacks, {
-			onStart: null,
-			onJobDone: callbacks.onJobDone,
-			onAbort: callbacks.onAbort,
-			onExit: callbacks.onExit
-		});
+	static public function writeFieldNoObject<T>(obj:Dynamic, name:String, value:T) {
+		try {
+			var cl = getNativeType(obj);
+			var field = cl.getField(name);
+			field.setAccessible(true);
+			try {
+				field.set(obj, value);
+			} catch (_:java.lang.IllegalArgumentException) {
+				if (value == null) {
+					field.setByte(obj, 0); // rely on widening
+				} else if (field.getType() == (cast Int) && instanceof(value, java.lang.Number)) {
+					// Can happen with ++ on Dynamic because that defaults to Float
+					field.setInt(obj, (cast value : java.lang.Number).intValue());
+				}
+			}
+		} catch (_:java.lang.NoSuchFieldException) {
+			return;
+		}
 	}
 
-	/**
-		This function is called when an uncaught exception aborted a thread.
-		The error will be printed to stdout but this function can be redefined.
-
-		If this function throws, the exception is forwarded to the default handler
-		(print to stdout) and `onExit` callbacks are still called.
-
-		It is generally good practice to call any previously existing callback
-		from functions assigned to this.
-	**/
-	function onAbort(e:haxe.Exception) {
-		var name = this.name;
-		if( name == null ) name = "" else name = " "+name;
-		Sys.println("THREAD"+name+" ABORTED : "+e.message+haxe.CallStack.toString(e.stack));
+	static public function writeField<T>(obj:Dynamic, name:String, value:T) {
+		if (obj == null || name == null) {
+			return;
+		}
+		if (instanceof(obj, Object)) {
+			return (obj : Object)._hx_setField(name, value);
+		}
+		writeFieldNoObject(obj, name, value);
 	}
 
-	static function __init__() {
-		mutex = new Mutex();
-		idCounter = 1;
-		mainThread = new Thread(ThreadImpl.current());
-		mainThread.name = "Main";
-		threads = [mainThread];
-		currentTLS = new Tls();
-		currentTLS.value = mainThread;
+	// string
+
+	static public function toString<T:java.lang.Object>(obj:T):String {
+		if (obj == null) {
+			return "null";
+		} else if (instanceof(obj, java.lang.Double.DoubleClass)) {
+			var n:java.lang.Number = cast obj;
+			if (n.doubleValue() == n.intValue()) {
+				return java.lang.Integer.IntegerClass.valueOf(n.intValue()).toString();
+			}
+			return obj.toString();
+		} else {
+			return obj.toString();
+		}
 	}
 
+	static public function stringConcat<A:java.lang.Object, B:java.lang.Object>(a:A, b:B):String {
+		return (cast toString(a) : java.NativeString).concat(toString(b));
+	}
+
+	// ops
+
+	static public function opAdd<T1:java.lang.Object, T2:java.lang.Object>(a:T1, b:T2):Dynamic {
+		if (instanceof(a, java.NativeString) || instanceof(b, java.NativeString)) {
+			return stringConcat(a, b);
+		}
+		if (instanceof(a, java.lang.Double.DoubleClass) || instanceof(b, java.lang.Double.DoubleClass)) {
+			return toDouble(a) + toDouble(b);
+		}
+		if (instanceof(a, java.lang.Long.LongClass) || instanceof(b, java.lang.Long.LongClass)) {
+			return toLong(a) + toLong(b);
+		}
+		if (instanceof(a, java.lang.Integer.IntegerClass) || instanceof(b, java.lang.Integer.IntegerClass)) {
+			return toInt(a) + toInt(b);
+		}
+		throw "Invalid operation";
+	}
+
+	static public function opSub<T1:java.lang.Object, T2:java.lang.Object>(a:T1, b:T2):Dynamic {
+		if (instanceof(a, java.lang.Double.DoubleClass) || instanceof(b, java.lang.Double.DoubleClass)) {
+			return toDouble(a) - toDouble(b);
+		}
+		if (instanceof(a, java.lang.Long.LongClass) || instanceof(b, java.lang.Long.LongClass)) {
+			return toLong(a) - toLong(b);
+		}
+		if (instanceof(a, java.lang.Integer.IntegerClass) || instanceof(b, java.lang.Integer.IntegerClass)) {
+			return toInt(a) - toInt(b);
+		}
+		throw "Invalid operation";
+	}
+
+	static public function opMul<T1:java.lang.Object, T2:java.lang.Object>(a:T1, b:T2):Dynamic {
+		if (instanceof(a, java.lang.Double.DoubleClass) || instanceof(b, java.lang.Double.DoubleClass)) {
+			return toDouble(a) * toDouble(b);
+		}
+		if (instanceof(a, java.lang.Long.LongClass) || instanceof(b, java.lang.Long.LongClass)) {
+			return toLong(a) * toLong(b);
+		}
+		if (instanceof(a, java.lang.Integer.IntegerClass) || instanceof(b, java.lang.Integer.IntegerClass)) {
+			return toInt(a) * toInt(b);
+		}
+		throw "Invalid operation";
+	}
+
+	static public function opDiv<T1:java.lang.Object, T2:java.lang.Object>(a:T1, b:T2):Dynamic {
+		if (instanceof(a, java.lang.Double.DoubleClass) || instanceof(b, java.lang.Double.DoubleClass)) {
+			return toDouble(a) / toDouble(b);
+		}
+		if (instanceof(a, java.lang.Long.LongClass) || instanceof(b, java.lang.Long.LongClass)) {
+			return toLong(a) / toLong(b);
+		}
+		if (instanceof(a, java.lang.Integer.IntegerClass) || instanceof(b, java.lang.Integer.IntegerClass)) {
+			return toInt(a) / toInt(b);
+		}
+		throw "Invalid operation";
+	}
+
+	static public function opMod<T1:java.lang.Object, T2:java.lang.Object>(a:T1, b:T2):Dynamic {
+		if (instanceof(a, java.lang.Double.DoubleClass) || instanceof(b, java.lang.Double.DoubleClass)) {
+			return toDouble(a) % toDouble(b);
+		}
+		if (instanceof(a, java.lang.Long.LongClass) || instanceof(b, java.lang.Long.LongClass)) {
+			return toLong(a) % toLong(b);
+		}
+		if (instanceof(a, java.lang.Integer.IntegerClass) || instanceof(b, java.lang.Integer.IntegerClass)) {
+			return toInt(a) % toInt(b);
+		}
+		throw "Invalid operation";
+	}
+
+	static public function opAnd<T1:java.lang.Object, T2:java.lang.Object>(a:T1, b:T2):Dynamic {
+		if (instanceof(a, java.lang.Long.LongClass) || instanceof(b, java.lang.Long.LongClass)) {
+			return toLong(a) & toLong(b);
+		}
+		if (instanceof(a, java.lang.Integer.IntegerClass) || instanceof(b, java.lang.Integer.IntegerClass)) {
+			return toInt(a) & toInt(b);
+		}
+		throw "Invalid operation";
+	}
+
+	static public function opOr<T1:java.lang.Object, T2:java.lang.Object>(a:T1, b:T2):Dynamic {
+		if (instanceof(a, java.lang.Long.LongClass) || instanceof(b, java.lang.Long.LongClass)) {
+			return toLong(a) | toLong(b);
+		}
+		if (instanceof(a, java.lang.Integer.IntegerClass) || instanceof(b, java.lang.Integer.IntegerClass)) {
+			return toInt(a) | toInt(b);
+		}
+		throw "Invalid operation";
+	}
+
+	static public function opXor<T1:java.lang.Object, T2:java.lang.Object>(a:T1, b:T2):Dynamic {
+		if (instanceof(a, java.lang.Long.LongClass) || instanceof(b, java.lang.Long.LongClass)) {
+			return toLong(a) ^ toLong(b);
+		}
+		if (instanceof(a, java.lang.Integer.IntegerClass) || instanceof(b, java.lang.Integer.IntegerClass)) {
+			return toInt(a) ^ toInt(b);
+		}
+		throw "Invalid operation";
+	}
+
+	static public function opShl<T1:java.lang.Object, T2:java.lang.Object>(a:T1, b:T2):Dynamic {
+		if (instanceof(a, java.lang.Long.LongClass) || instanceof(b, java.lang.Long.LongClass)) {
+			return toLong(a) << toInt(b);
+		}
+		if (instanceof(a, java.lang.Integer.IntegerClass) || instanceof(b, java.lang.Integer.IntegerClass)) {
+			return toInt(a) << toInt(b);
+		}
+		throw "Invalid operation";
+	}
+
+	static public function opShr<T1:java.lang.Object, T2:java.lang.Object>(a:T1, b:T2):Dynamic {
+		if (instanceof(a, java.lang.Long.LongClass) || instanceof(b, java.lang.Long.LongClass)) {
+			return toLong(a) >> toInt(b);
+		}
+		if (instanceof(a, java.lang.Integer.IntegerClass) || instanceof(b, java.lang.Integer.IntegerClass)) {
+			return toInt(a) >> toInt(b);
+		}
+		throw "Invalid operation";
+	}
+
+	static public function opUshr<T1:java.lang.Object, T2:java.lang.Object>(a:T1, b:T2):Dynamic {
+		if (instanceof(a, java.lang.Long.LongClass) || instanceof(b, java.lang.Long.LongClass)) {
+			return toLong(a) >>> toInt(b);
+		}
+		if (instanceof(a, java.lang.Integer.IntegerClass) || instanceof(b, java.lang.Integer.IntegerClass)) {
+			return toInt(a) >>> toInt(b);
+		}
+		throw "Invalid operation";
+	}
+
+	static public function opIncrement<T1:java.lang.Object>(a:T1):Dynamic {
+		if (instanceof(a, java.lang.Double.DoubleClass)) {
+			return toDouble(a) + 1.;
+		}
+		if (instanceof(a, java.lang.Long.LongClass)) {
+			return toLong(a) + 1.;
+		}
+		if (instanceof(a, java.lang.Integer.IntegerClass)) {
+			return toInt(a) + 1;
+		}
+		throw "Invalid operation";
+	}
+
+	static public function opDecrement<T1:java.lang.Object>(a:T1):Dynamic {
+		if (instanceof(a, java.lang.Double.DoubleClass)) {
+			return toDouble(a) - 1.;
+		}
+		if (instanceof(a, java.lang.Long.LongClass)) {
+			return toLong(a) - 1.;
+		}
+		if (instanceof(a, java.lang.Integer.IntegerClass)) {
+			return toInt(a) - 1;
+		}
+		throw "Invalid operation";
+	}
+
+	static public function opNeg<T1:java.lang.Object>(a:T1):Dynamic {
+		if (instanceof(a, java.lang.Double.DoubleClass)) {
+			return -toDouble(a);
+		}
+		if (instanceof(a, java.lang.Long.LongClass)) {
+			return -toLong(a);
+		}
+		if (instanceof(a, java.lang.Integer.IntegerClass)) {
+			return -toInt(a);
+		}
+		throw "Invalid operation";
+	}
+
+	static public function opNegBits<T1:java.lang.Object>(a:T1):Dynamic {
+		if (instanceof(a, java.lang.Long.LongClass)) {
+			return ~toLong(a);
+		}
+		if (instanceof(a, java.lang.Integer.IntegerClass)) {
+			return ~toInt(a);
+		}
+		throw "Invalid operation";
+	}
+
+	extern public static inline function lock<T>(obj:Dynamic, block:T):Void {
+		untyped __lock__(obj, block);
+	}
 }
